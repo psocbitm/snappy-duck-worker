@@ -12,7 +12,7 @@ const logger = getLogger(import.meta.url);
  * Global instances for the Redis clients.
  * These will be initialized after successful connection and can be accessed via getter functions.
  */
-let redisDB, redisQueue, redisPubSub;
+let redisQueue, redisPubSub;
 
 /**
  * A Map to track pending requests, mapping request IDs to WebSocket connections.
@@ -27,15 +27,9 @@ let redisDB, redisQueue, redisPubSub;
 async function setupRedis() {
   try {
     // Create Redis clients with their respective configurations
-    redisDB = createClient(redisConfig.redisDB);
     redisQueue = createClient(redisConfig.redisQueue);
     redisPubSub = createClient(redisConfig.redisPubSub);
 
-    // Set up error handlers for ongoing errors after connection
-    redisDB.on("error", (err) => {
-      console.error("Redis DB error:", err);
-      // Optionally, implement reconnection logic or graceful shutdown here
-    });
     redisQueue.on("error", (err) => {
       console.error("Redis Queue error:", err);
       // Optionally, implement reconnection logic or graceful shutdown here
@@ -47,32 +41,12 @@ async function setupRedis() {
 
     // Connect to all three Redis instances concurrently
     await Promise.all([
-      redisDB.connect(),
       redisQueue.connect(),
       redisPubSub.connect(),
     ]);
 
-    // // Configure the pub/sub subscription to receive executed code
-    // await redisPubSub.subscribe("executed_code", (message) => {
-    //   try {
-    //     // Parse the incoming message, expecting { id, result }
-    //     const { id, result } = JSON.parse(message);
-    //     const ws = pendingRequests.get(id);
-    //     if (ws) {
-    //       // Send the result back to the corresponding WebSocket client
-    //       ws.send(JSON.stringify({ id, result }));
-    //       pendingRequests.delete(id); // Clean up after sending
-    //     } else {
-    //       console.warn(`No pending request found for id: ${id}`);
-    //     }
-    //   } catch (err) {
-    //     console.error("Error processing pub/sub message:", err);
-    //   }
-    // });
-
     logger.info({
       log: "All Redis clients connected",
-      redisDB: redisDB.isReady,
       redisQueue: redisQueue.isReady,
       redisPubSub: redisPubSub.isReady,
     });
@@ -90,4 +64,4 @@ async function setupRedis() {
  * These ensure that the instances are only accessed after setupRedis() has completed.
  */
 export { setupRedis };
-export { redisDB, redisQueue, redisPubSub };
+export { redisQueue, redisPubSub };
