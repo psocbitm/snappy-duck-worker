@@ -1,21 +1,13 @@
-# Use official Node.js LTS version as base image
 FROM node:slim
 
-# Install pnpm
-RUN corepack enable
+WORKDIR /app
 
-# Set working directory in container
-WORKDIR /usr/src/app
+RUN npm install -g pnpm pm2
 
-# Install dependencies first (for caching)
-COPY package*.json ./
+COPY package.json ./
+
 RUN pnpm install --prod
 
-# Copy the rest of the app
 COPY . .
 
-# Expose port (change if needed)
-EXPOSE 3000
-
-# Start the app
-CMD ["node", "index.js"]
+CMD ["pm2-runtime", "start", "index.js"]

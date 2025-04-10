@@ -1,131 +1,183 @@
-import { languageConfigs } from "../config/languageConfig.js";
-import { spawn } from "child_process";
-import { promises as fs } from "fs";
-import { join } from "path";
-import { tmpdir } from "os";
-import { randomUUID } from "crypto";
-import { getLogger } from "../utils/logger.js";
+import Docker from "dockerode";
+const docker = new Docker({ socketPath: "/var/run/docker.sock" });
 
-// Constants
-const EXECUTION_TIMEOUT = "10s";
-const MEMORY_LIMIT = "256m";
-const CPU_LIMIT = "0.5";
-
-/**
- * Executes code in a secure Docker sandbox environment.
- * @param {Object} params - Execution parameters
- * @param {string} params.code - Source code to execute
- * @param {string} params.language - Programming language
- * @param {string} [params.input] - Input for stdin
- * @returns {Promise<string>} - Execution output or error message
- * @throws {Error} - On critical execution failures
- */
-export const runCode = async ({ code, language, input = "" }) => {
-  const logger = getLogger(import.meta.url);
-
-  logger.info({
-    message: "Executing code",
-    language,
-    hasInput: !!input,
-  });
-
-  const config = validateLanguage(language);
-  const tempFile = createTempFilePath(config.fileName);
-
+export async function runCode({ code, language, input }) {
+  console.info("Starting code execution with language:", language);
+  let container;
   try {
-    await fs.writeFile(tempFile, code, { encoding: "utf8" });
-    const result = await executeInDocker({ config, tempFile, input });
-    return result;
+    const languageConfigs = {
+      cpp: {
+        image: "gcc:latest",
+        ext: "cpp",
+        compileCmd: "g++ code.cpp -o code",
+        runCmd: "./code",
+      },
+      java: {
+        image: "openjdk:latest",
+        ext: "java",
+        compileCmd: "javac Main.java",
+        runCmd: "java Main",
+        filename: "Main.java",
+      },
+      python: {
+        image: "python:slim",
+        ext: "py",
+        compileCmd: null,
+        runCmd: "python code.py",
+      },
+      javascript: {
+        image: "node:slim", // Changed from slim to latest for better compatibility
+        ext: "js",
+        compileCmd: null,
+        runCmd: "node code.js",
+      },
+    };
+
+    if (!languageConfigs[language]) {
+      console.info("Unsupported language requested:", language);
+      throw new Error(
+        "Unsupported language. Supported languages: cpp, java, python, javascript"
+      );
+    }
+
+    const config = languageConfigs[language];
+    const containerFileName = config.filename || `code.${config.ext}`;
+    const execCmd = [config.compileCmd, config.runCmd].filter(Boolean);
+    console.info("Using container file name:", containerFileName);
+    console.info("Execution commands:", execCmd);
+
+    // Create container
+    console.info("Creating container with image:", config.image);
+    container = await docker.createContainer({
+      Image: config.image,
+      Tty: false, // Changed to false for better stream handling
+      OpenStdin: true,
+      StdinOnce: true,
+      WorkingDir: "/app",
+      HostConfig: {
+        Memory: 512 * 1024 * 1024,
+        AutoRemove: true,
+      },
+    });
+
+    // Start container
+    console.info("Starting container");
+    await container.start();
+
+    // Copy code to container
+    console.info("Copying code to container");
+    const codeCommand = `echo "${Buffer.from(code).toString(
+      "base64"
+    )}" | base64 -d > /app/${containerFileName}`;
+    await execContainerCommand(container, ["bash", "-c", codeCommand]);
+
+    // Execute the code
+    console.info("Creating execution environment");
+    const exec = await container.exec({
+      Cmd: ["bash", "-c", execCmd.join(" && ")],
+      AttachStdin: true,
+      AttachStdout: true,
+      AttachStderr: true,
+      Tty: false,
+    });
+
+    console.info("Executing code and waiting for output");
+    const output = await new Promise((resolve, reject) => {
+      let stdout = "";
+      let stderr = "";
+
+      exec.start({ hijack: true, stdin: true }, (err, stream) => {
+        if (err) return reject(err);
+
+        // Handle stream events
+        docker.modem.demuxStream(
+          stream,
+          {
+            write: (data) => {
+              stdout += data.toString();
+            },
+          },
+          {
+            write: (data) => {
+              stderr += data.toString();
+            },
+          }
+        );
+
+        // Write input and close stdin
+        if (input) {
+          console.info("Writing input to container");
+          stream.write(input);
+        }
+        stream.end();
+
+        stream.on("end", () => {
+          console.info("Stream ended, resolving output");
+          resolve(stdout || stderr);
+        });
+        stream.on("error", (error) => {
+          console.info("Stream error occurred:", error.message);
+          reject(new Error(`Stream error: ${error.message}`));
+        });
+      });
+    });
+
+    console.info("Execution completed successfully");
+    console.log("Execution Output:", output);
+    return output;
   } catch (error) {
-    throw new Error(`Execution failed for ${language}: ${error.message}`);
+    console.error("Error executing code:", error.message);
+    throw error;
   } finally {
-    await cleanupTempFile(tempFile);
+    // Ensure container cleanup if not auto-removed
+    if (container) {
+      console.info("Cleaning up container");
+      try {
+        await container.stop();
+      } catch (e) {
+        // Ignore stop errors as container might already be removed
+        console.info("Container already removed or stopped", e);
+      }
+    }
   }
-};
-
-/**
- * Validates language and returns its configuration.
- * @param {string} language - Programming language
- * @returns {Object} - Language configuration
- */
-function validateLanguage(language) {
-  const config = languageConfigs[language];
-  if (!config) {
-    throw new Error(
-      `Unsupported language: ${language}. Supported: ${Object.keys(
-        languageConfigs
-      ).join(", ")}`
-    );
-  }
-  return config;
 }
 
-/**
- * Creates a unique temporary file path.
- * @param {string} fileName - Base filename
- * @returns {string} - Full temporary path
- */
-function createTempFilePath(fileName) {
-  return join(tmpdir(), `code-${randomUUID()}-${fileName}`);
-}
-
-/**
- * Executes code in Docker container.
- * @param {Object} params - Execution parameters
- * @param {Object} params.config - Language configuration
- * @param {string} params.tempFile - Temporary file path
- * @param {string} params.input - Input string
- * @returns {Promise<string>} - Execution result
- */
-async function executeInDocker({ config, tempFile, input }) {
-  const dockerArgs = [
-    "run",
-    "-i",
-    "--rm",
-    `--memory=${MEMORY_LIMIT}`,
-    `--cpus=${CPU_LIMIT}`,
-    "--network=none",
-    "-v",
-    `${tempFile}:/app/${config.fileName}`,
-    config.image,
-    "timeout",
-    EXECUTION_TIMEOUT,
-    ...config.cmdArgs,
-  ];
+async function execContainerCommand(container, cmd) {
+  console.info("Executing container command:", cmd);
+  const exec = await container.exec({
+    Cmd: cmd,
+    AttachStdout: true,
+    AttachStderr: true,
+    Tty: false,
+  });
 
   return new Promise((resolve, reject) => {
-    const process = spawn("docker", dockerArgs, {
-      stdio: ["pipe", "pipe", "pipe"],
-    });
+    exec.start({ hijack: true }, (err, stream) => {
+      if (err) return reject(err);
 
-    let output = "";
-    let errorOutput = "";
+      let output = "";
+      docker.modem.demuxStream(
+        stream,
+        {
+          write: (data) => {
+            output += data.toString();
+          },
+        },
+        {
+          write: (data) => {
+            output += data.toString();
+          },
+        }
+      );
 
-    process.stdout.on("data", (data) => (output += data.toString("utf8")));
-    process.stderr.on("data", (data) => (errorOutput += data.toString("utf8")));
-    process.on("error", (err) =>
-      reject(new Error(`Docker spawn failed: ${err.message}`))
-    );
-
-    process.stdin.write(input);
-    process.stdin.end();
-
-    process.on("close", (code) => {
-      if (code === 0) resolve(output.trim());
-      else if (code === 124) resolve("Timeout: Execution exceeded 10 seconds");
-      else resolve(errorOutput.trim() || `Execution failed with code ${code}`);
+      stream.on("end", () => {
+        console.info("Container command completed");
+        resolve(output);
+      });
+      stream.on("error", (err) => {
+        console.info("Container command error:", err);
+        reject(err);
+      });
     });
   });
-}
-
-/**
- * Safely removes temporary file.
- * @param {string} filePath - Path to file
- */
-async function cleanupTempFile(filePath) {
-  try {
-    await fs.unlink(filePath);
-  } catch (error) {
-    console.error(`Cleanup failed for ${filePath}: ${error.message}`);
-  }
 }
