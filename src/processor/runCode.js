@@ -1,214 +1,180 @@
-import Docker from "dockerode";
-const docker = new Docker({ socketPath: "/var/run/docker.sock" });
+const Docker = require("dockerode");
+const { PassThrough } = require("stream");
 
-// Define supported languages and their configurations
+// Initialize Docker client
+const docker = new Docker();
+
+// Configuration for supported languages
 const languageConfigs = {
   cpp: {
-    image: "cpp-alpine",
-    ext: "cpp",
-    compileCmd: "g++ code.cpp -o code",
-    runCmd: "./code",
-  },
-  java: {
-    image: "amazoncorretto:24-alpine",
-    ext: "java",
-    compileCmd: "javac Main.java",
-    runCmd: "java Main",
-    filename: "Main.java",
+    image: "cpp-latest",
+    extension: "cpp",
+    compileCmd: "g++ main.cpp -o main",
+    runCmd: "./main",
   },
   python: {
     image: "python:slim",
-    ext: "py",
+    extension: "py",
     compileCmd: null,
-    runCmd: "python code.py",
+    runCmd: "python main.py",
   },
   javascript: {
-    image: "node:slim", // Note: Comment mentions 'latest', but code uses 'slim'
-    ext: "js",
+    image: "node:slim",
+    extension: "js",
     compileCmd: null,
-    runCmd: "node code.js",
+    runCmd: "node main.js",
+  },
+  java: {
+    image: "amazoncorretto:24-alpine",
+    extension: "java",
+    compileCmd: "javac Main.java",
+    runCmd: "java Main",
   },
 };
 
-// Container pool management
-const containerPool = new Map();
-const languages = ["cpp", "java", "python", "javascript"];
-const poolSize = 5; // Number of containers per language
-
-// Initialize pool at application startup
-async function initializePool() {
-  console.info("Initializing container pool...");
-  for (const lang of languages) {
-    containerPool.set(lang, []);
-    const pool = containerPool.get(lang);
-    for (let i = 0; i < poolSize; i++) {
-      const container = await createContainer(lang);
-      pool.push({ container, status: "idle" });
-    }
+/**
+ * Executes code in a Docker container for the specified language.
+ * @param {string} code - The source code to execute.
+ * @param {string} language - The programming language ('cpp', 'python', 'javascript', 'java').
+ * @param {string} input - The input data for the code (via stdin).
+ * @returns {Promise<{ output: string, error: string }>} - The execution result with stdout and stderr.
+ * @throws {Error} - If the language is unsupported or an unexpected error occurs.
+ */
+export async function runCode({ code, language, input }) {
+  // Validate language
+  const config = languageConfigs[language];
+  if (!config) {
+    throw new Error(`Unsupported language: ${language}`);
   }
-  console.info("Container pool initialized.");
-}
 
-// Create and start a container for a given language
-async function createContainer(lang) {
-  const config = languageConfigs[lang];
+  const { image, extension, compileCmd, runCmd } = config;
+  const filename = `main.${extension}`;
+
+  // Create Docker container
   const container = await docker.createContainer({
-    Image: config.image,
+    Image: image,
     Tty: false,
-    OpenStdin: true,
-    StdinOnce: false, // Keep stdin open for reuse
-    WorkingDir: "/app",
+    // Keep container alive until execution completes
+    Cmd: ["/bin/sh", "-c", "while true; do sleep 1; done"],
     HostConfig: {
+      // Limit resources for security and stability
       Memory: 512 * 1024 * 1024, // 512MB memory limit
-      AutoRemove: false, // Keep container running
+      CpuPeriod: 100000,
+      CpuQuota: 50000, // Limit CPU usage
     },
   });
-  await container.start();
-  return container;
-}
-
-// Modified execContainerCommand to support stdin input
-async function execContainerCommand(container, cmd, input = null) {
-  console.info("Executing container command:", cmd);
-  const exec = await container.exec({
-    Cmd: cmd,
-    AttachStdin: !!input, // Enable stdin only if input is provided
-    AttachStdout: true,
-    AttachStderr: true,
-    Tty: false,
-  });
-
-  return new Promise((resolve, reject) => {
-    exec.start({ hijack: true, stdin: !!input }, (err, stream) => {
-      if (err) return reject(err);
-
-      if (input) {
-        stream.write(input);
-        stream.end();
-      }
-
-      let output = "";
-      docker.modem.demuxStream(
-        stream,
-        { write: (data) => (output += data.toString()) },
-        { write: (data) => (output += data.toString()) }
-      );
-
-      stream.on("end", () => {
-        console.info("Container command completed");
-        resolve(output);
-      });
-      stream.on("error", (err) => {
-        console.error("Container command error:", err);
-        reject(err);
-      });
-    });
-  });
-}
-
-// Main function to run code
-export async function runCode({ code, language, input }) {
-  console.info("Starting code execution with language:", language);
-
-  // Validate language
-  if (!languageConfigs[language]) {
-    console.info("Unsupported language requested:", language);
-    throw new Error(
-      "Unsupported language. Supported languages: cpp, java, python, javascript"
-    );
-  }
-
-  const config = languageConfigs[language];
-  const containerFileName = config.filename || `code.${config.ext}`;
-  const execCmd = [config.compileCmd, config.runCmd].filter(Boolean);
-  console.info("Using container file name:", containerFileName);
-  console.info("Execution commands:", execCmd);
-
-  // Get or create a container from the pool
-  let pool = containerPool.get(language);
-  if (!pool) {
-    throw new Error(`No pool for language: ${language}`);
-  }
-  let containerObj = pool.find((c) => c.status === "idle");
-  if (!containerObj) {
-    console.info("No idle containers, creating a new one for:", language);
-    const container = await createContainer(language);
-    containerObj = { container, status: "busy" };
-    pool.push(containerObj);
-  } else {
-    containerObj.status = "busy";
-    console.info("Using idle container for:", language);
-  }
-  const container = containerObj.container;
 
   try {
-    // Clean up working directory
-    console.info("Cleaning up working directory");
-    await execContainerCommand(container, ["bash", "-c", "rm -rf /app/*"]);
+    // Start the container
+    await container.start();
 
-    // Copy code directly to container
-    console.info("Copying code to container");
-    await execContainerCommand(
-      container,
-      ["bash", "-c", `cat > /app/${containerFileName}`],
-      code
-    );
+    // Write code to file using base64 to handle special characters
+    const base64Code = Buffer.from(code).toString("base64");
+    const writeCmd = `echo '${base64Code}' | base64 -d > ${filename}`;
+    const writeExec = await container.exec({
+      Cmd: ["sh", "-c", writeCmd],
+      AttachStdout: true,
+      AttachStderr: true,
+    });
 
-    // Execute the code
-    console.info("Creating execution environment");
-    const exec = await container.exec({
-      Cmd: ["bash", "-c", execCmd.join(" && ")],
+    const writeStream = await writeExec.start({ hijack: true });
+    const writeStderrStream = new PassThrough();
+    let writeStderr = "";
+    writeStderrStream.on("data", (data) => (writeStderr += data.toString()));
+    docker.modem.demuxStream(writeStream, new PassThrough(), writeStderrStream);
+
+    await new Promise((resolve) => writeStream.on("end", resolve));
+    const writeInspect = await writeExec.inspect();
+    if (writeInspect.ExitCode !== 0) {
+      throw new Error(`Failed to write code to file: ${writeStderr}`);
+    }
+
+    // Compile code if required (C++ and Java)
+    let compileError = "";
+    if (compileCmd) {
+      const compileExec = await container.exec({
+        Cmd: ["sh", "-c", compileCmd],
+        AttachStdout: true,
+        AttachStderr: true,
+      });
+
+      const compileStream = await compileExec.start({ hijack: true });
+      const compileStderrStream = new PassThrough();
+      compileStderrStream.on(
+        "data",
+        (data) => (compileError += data.toString())
+      );
+      docker.modem.demuxStream(
+        compileStream,
+        new PassThrough(),
+        compileStderrStream
+      );
+
+      await new Promise((resolve) => compileStream.on("end", resolve));
+      const compileInspect = await compileExec.inspect();
+      if (compileInspect.ExitCode !== 0) {
+        return { output: "", error: compileError };
+      }
+    }
+
+    // Execute the code with input
+    const runExec = await container.exec({
+      Cmd: ["sh", "-c", runCmd],
       AttachStdin: true,
       AttachStdout: true,
       AttachStderr: true,
-      Tty: false,
     });
 
-    console.info("Executing code and waiting for output");
-    const output = await new Promise((resolve, reject) => {
-      let stdout = "";
-      let stderr = "";
+    const runStream = await runExec.start({ hijack: true, stdin: true });
+    const stdoutStream = new PassThrough();
+    const stderrStream = new PassThrough();
+    let output = "";
+    let error = "";
+    stdoutStream.on("data", (data) => (output += data.toString()));
+    stderrStream.on("data", (data) => (error += data.toString()));
+    docker.modem.demuxStream(runStream, stdoutStream, stderrStream);
 
-      exec.start({ hijack: true, stdin: true }, (err, stream) => {
-        if (err) return reject(err);
+    // Provide input via stdin
+    runStream.write(input);
+    runStream.end();
 
-        docker.modem.demuxStream(
-          stream,
-          { write: (data) => (stdout += data.toString()) },
-          { write: (data) => (stderr += data.toString()) }
-        );
+    await new Promise((resolve) => runStream.on("end", resolve));
+    const runInspect = await runExec.inspect();
+    if (runInspect.ExitCode !== 0) {
+      return { output: "", error: output + error };
+    }
 
-        if (input) {
-          console.info("Writing input to container");
-          stream.write(input);
-        }
-        stream.end();
-
-        stream.on("end", () => {
-          console.info("Stream ended, resolving output");
-          resolve(stdout || stderr);
-        });
-        stream.on("error", (error) => {
-          console.error("Stream error occurred:", error.message);
-          reject(new Error(`Stream error: ${error.message}`));
-        });
-      });
-    });
-
-    console.info("Execution completed successfully");
-    console.log("Execution Output:", output);
-    return output;
-  } catch (error) {
-    console.error("Error executing code:", error.message);
-    throw error;
+    return { output, error };
   } finally {
-    // Mark container as idle (no stop/remove since we reuse it)
-    containerObj.status = "idle";
-    console.info("Container marked as idle");
+    // Ensure container cleanup
+    try {
+      await container.stop();
+      await container.remove();
+    } catch (cleanupError) {
+      console.error("Container cleanup failed:", cleanupError);
+    }
   }
 }
 
-// Initialize the pool when the application starts
-initializePool().catch((err) =>
-  console.error("Failed to initialize pool:", err)
-);
+// Example usage (for testing purposes)
+/*
+(async () => {
+  try {
+    const cppCode = `
+      #include <iostream>
+      using namespace std;
+      int main() {
+        string input;
+        getline(cin, input);
+        cout << "Hello, " << input << "!" << endl;
+        return 0;
+      }
+    `;
+    const result = await runCode(cppCode, 'cpp', 'World');
+    console.log('Output:', result.output);
+    console.log('Error:', result.error);
+  } catch (err) {
+    console.error('Error:', err.message);
+  }
+})();
+*/
