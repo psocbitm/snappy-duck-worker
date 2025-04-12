@@ -1,22 +1,32 @@
 export const languageConfigs = {
   cpp: {
-    image: "cpp-alpine",
-    fileName: "main.cpp",
-    cmdArgs: ["sh", "-c", "g++ /app/main.cpp -o /app/main && /app/main"],
-  },
-  python: {
-    image: "python:slim",
-    fileName: "main.py",
-    cmdArgs: ["python", "/app/main.py"],
+    image: "gcc:latest",
+    sourceFileName: "main.cpp",
+    compile: (sourceFile, programFile) => [
+      "g++",
+      sourceFile,
+      "-o",
+      programFile,
+      "-std=c++17", // Add C++17 support
+    ],
+    run: (sourceFile, programFile) => programFile,
   },
   java: {
     image: "amazoncorretto:24-alpine",
-    fileName: "Main.java",
-    cmdArgs: ["sh", "-c", "javac -cp /app /app/Main.java && java -cp /app Main"],
+    sourceFileName: "Main.java",
+    compile: (sourceFile) => ["javac", sourceFile],
+    run: () => "java Main",
   },
   javascript: {
-    image: "node:slim",
-    fileName: "main.js",
-    cmdArgs: ["node", "/app/main.js"],
+    image: "node:alpine",
+    sourceFileName: "main.js",
+    compile: null,
+    run: (sourceFile) => `node ${sourceFile}`,
+  },
+  python: {
+    image: "python:alpine",
+    sourceFileName: "main.py",
+    compile: null,
+    run: (sourceFile) => `python ${sourceFile}`,
   },
 };

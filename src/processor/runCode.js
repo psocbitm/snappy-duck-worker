@@ -1,75 +1,103 @@
 import Docker from "dockerode";
 import { PassThrough } from "stream";
+import { languageConfigs } from "../config/languageConfig.js";
+
 const docker = new Docker();
 
 /**
- * Executes C++ code inside a Docker container and returns the output.
+ * Executes code in the specified language inside a Docker container.
  * @param {Object} params - Parameters for code execution
- * @param {string} params.language - Programming language (e.g., "cpp")
- * @param {string} params.code - C++ source code to execute
+ * @param {string} params.language - Programming language ("cpp", "java", "javascript", "python")
+ * @param {string} params.code - Source code to execute
  * @param {string} [params.input] - Optional input for the program
  * @returns {Promise<Object>} Execution result with success status, output, and error
  */
 export async function runCode({ language, code, input }) {
+  const config = languageConfigs[language];
+  if (!config) {
+    throw new Error(`Unsupported language: ${language}`);
+  }
+
   let container;
   try {
-    // Validate input parameters
-    if (language !== "cpp" || !code) {
-      throw new Error("Invalid language or missing code");
-    }
-
-    // Create container with auto-remove enabled
+    // Create container with auto-remove enabled for cleanup and resource limits
     container = await docker.createContainer({
-      Image: "gcc:latest",
+      Image: config.image,
       Tty: false,
       OpenStdin: true,
-      HostConfig: { AutoRemove: true },
+      HostConfig: {
+        AutoRemove: true,
+        Memory: 512 * 1024 * 1024, // 512MB memory limit
+        CpuPeriod: 100000,
+        CpuQuota: 50000, // 50% CPU limit
+      },
+      WorkingDir: "/tmp", // Set working directory explicitly
     });
 
     await container.start();
 
-    const sourceFile = "/tmp/main.cpp";
+    const sourceFile = `/tmp/${config.sourceFileName}`;
     const inputFile = "/tmp/input.txt";
-    const programFile = "/tmp/program";
+    const programFile = language === "cpp" ? "/tmp/program" : null;
 
-    // Write code to file in container
+    // Write code to sourceFile using base64 to handle special characters
+    const codeBase64 = Buffer.from(code).toString("base64");
     await executeCommand(container, [
       "sh",
       "-c",
-      `echo '${code.replace(/'/g, "'\\''")}' > ${sourceFile}`,
+      `echo '${codeBase64}' | base64 -d > ${sourceFile}`,
     ]);
 
-    // Write input to file if provided
+    // Write input to inputFile if provided
     if (input) {
+      const inputBase64 = Buffer.from(input).toString("base64");
       await executeCommand(container, [
         "sh",
         "-c",
-        `echo '${input.replace(/'/g, "'\\''")}' > ${inputFile}`,
+        `echo '${inputBase64}' | base64 -d > ${inputFile}`,
       ]);
     }
 
-    // Compile the C++ code
-    const compileOutput = await executeCommand(container, [
-      "g++",
-      sourceFile,
-      "-o",
-      programFile,
-    ]);
+    // Set appropriate file permissions
+    await executeCommand(container, ["chmod", "644", sourceFile]);
+    if (input) {
+      await executeCommand(container, ["chmod", "644", inputFile]);
+    }
 
-    if (compileOutput.exitCode !== 0) {
+    // Compile if necessary (C++ and Java)
+    if (config.compile) {
+      const compileCmd = config.compile(sourceFile, programFile);
+      const compileOutput = await executeCommand(container, compileCmd);
+      if (compileOutput.exitCode !== 0) {
+        return {
+          success: false,
+          error: `Compilation failed: ${compileOutput.stderr}`,
+        };
+      }
+      // Set executable permissions for compiled programs
+      if (programFile) {
+        await executeCommand(container, ["chmod", "755", programFile]);
+      }
+    }
+
+    // Run the program with optional input redirection and timeout
+    const runCmdBase = config.run(sourceFile, programFile);
+    const runCmd = input
+      ? `timeout 5s ${runCmdBase} < ${inputFile}`
+      : `timeout 5s ${runCmdBase}`;
+    const programOutput = await executeCommand(container, ["sh", "-c", runCmd]);
+
+    if (programOutput.exitCode === 124) {
+      // timeout exit code
       return {
         success: false,
-        error: `Compilation failed: ${compileOutput.stderr}`,
+        error: "Execution timed out after 5 seconds",
       };
     }
 
-    // Run the compiled program
-    const runCmd = input ? `${programFile} < ${inputFile}` : programFile;
-    const programOutput = await executeCommand(container, ["sh", "-c", runCmd]);
-
-    // Return result immediately
+    // Return execution result
     return {
-      success: true,
+      success: programOutput.exitCode === 0,
       output: programOutput.stdout,
       error: programOutput.stderr,
     };
@@ -79,7 +107,7 @@ export async function runCode({ language, code, input }) {
       error: error.message,
     };
   } finally {
-    // Stop container in the background without awaiting
+    // Stop and remove container in the background
     if (container) {
       container.stop().catch((err) => {
         console.error("Error stopping container:", err);
@@ -114,7 +142,13 @@ async function executeCommand(container, cmd) {
   stderr.on("data", (chunk) => (stderrData += chunk.toString()));
 
   return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      stream.destroy();
+      reject(new Error("Command execution timed out"));
+    }, 10000); // 10 second timeout
+
     stream.on("end", async () => {
+      clearTimeout(timeout);
       try {
         const { ExitCode } = await exec.inspect();
         resolve({
@@ -126,6 +160,10 @@ async function executeCommand(container, cmd) {
         reject(error);
       }
     });
-    stream.on("error", reject);
+
+    stream.on("error", (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
   });
 }
