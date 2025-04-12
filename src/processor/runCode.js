@@ -1,169 +1,139 @@
 import Docker from "dockerode";
-import { PassThrough } from "stream";
 import { languageConfigs } from "../config/languageConfig.js";
+import { executeCommand } from "./executeCommand.js";
+import { setFilePermissions } from "../utils/setFilePermissions.js";
+import { writeBase64File } from "../utils/writeBase64File.js";
+import { getOutput } from "./getOutput.js";
+import { getLogger } from "../utils/logger.js";
+const logger = getLogger(import.meta.url);
 
 const docker = new Docker();
 
-/**
- * Executes code in the specified language inside a Docker container.
- * @param {Object} params - Parameters for code execution
- * @param {string} params.language - Programming language ("cpp", "java", "javascript", "python")
- * @param {string} params.code - Source code to execute
- * @param {string} [params.input] - Optional input for the program
- * @returns {Promise<Object>} Execution result with success status, output, and error
- */
 export async function runCode({ language, code, input }) {
+  logger.info({
+    log: "Running code",
+    language: language,
+    input: input,
+  });
   const config = languageConfigs[language];
   if (!config) {
-    throw new Error(`Unsupported language: ${language}`);
+    logger.error({
+      log: "Unsupported language requested",
+      language: language,
+    });
+    return { success: false, error: `Unsupported language: ${language}` };
   }
 
+  const sourceFile = `/tmp/${config.sourceFileName}`;
+  const inputFile = "/tmp/input.txt";
+  const programFile = language === "cpp" ? "/tmp/program" : null;
+
   let container;
+
   try {
-    // Create container with auto-remove enabled for cleanup and resource limits
+    logger.info({
+      log: "Creating container with image",
+      image: config.image,
+    });
     container = await docker.createContainer({
       Image: config.image,
       Tty: false,
       OpenStdin: true,
+      WorkingDir: "/tmp",
       HostConfig: {
         AutoRemove: true,
-        Memory: 512 * 1024 * 1024, // 512MB memory limit
+        Memory: 512 * 1024 * 1024, // 512MB
         CpuPeriod: 100000,
-        CpuQuota: 50000, // 50% CPU limit
+        CpuQuota: 50000, // 50% CPU
       },
-      WorkingDir: "/tmp", // Set working directory explicitly
     });
 
     await container.start();
+    logger.info({
+      log: "Container started successfully",
+    });
 
-    const sourceFile = `/tmp/${config.sourceFileName}`;
-    const inputFile = "/tmp/input.txt";
-    const programFile = language === "cpp" ? "/tmp/program" : null;
-
-    // Write code to sourceFile using base64 to handle special characters
-    const codeBase64 = Buffer.from(code).toString("base64");
-    await executeCommand(container, [
-      "sh",
-      "-c",
-      `echo '${codeBase64}' | base64 -d > ${sourceFile}`,
-    ]);
-
-    // Write input to inputFile if provided
+    // Step 1: Write code and input files
+    await writeBase64File(container, sourceFile, code);
     if (input) {
-      const inputBase64 = Buffer.from(input).toString("base64");
-      await executeCommand(container, [
-        "sh",
-        "-c",
-        `echo '${inputBase64}' | base64 -d > ${inputFile}`,
-      ]);
+      await writeBase64File(container, inputFile, input);
     }
 
-    // Set appropriate file permissions
-    await executeCommand(container, ["chmod", "644", sourceFile]);
+    await setFilePermissions(container, sourceFile, "644");
     if (input) {
-      await executeCommand(container, ["chmod", "644", inputFile]);
+      await setFilePermissions(container, inputFile, "644");
     }
 
-    // Compile if necessary (C++ and Java)
+    // Step 2: Compile (if necessary)
     if (config.compile) {
+      logger.info({
+        log: "Compiling code...",
+      });
       const compileCmd = config.compile(sourceFile, programFile);
-      const compileOutput = await executeCommand(container, compileCmd);
-      if (compileOutput.exitCode !== 0) {
+      const compileResult = await executeCommand(container, compileCmd);
+      if (compileResult.exitCode !== 0) {
+        logger.error({
+          log: "Compilation failed",
+          error: compileResult.stderr,
+        });
         return {
           success: false,
-          error: `Compilation failed: ${compileOutput.stderr}`,
+          error: `Compilation failed:\n${compileResult.stderr.trim()}`,
         };
       }
-      // Set executable permissions for compiled programs
+      logger.info({
+        log: "Compilation successful",
+      });
+
       if (programFile) {
-        await executeCommand(container, ["chmod", "755", programFile]);
+        await setFilePermissions(container, programFile, "755");
       }
     }
 
-    // Run the program with optional input redirection and timeout
-    const runCmdBase = config.run(sourceFile, programFile);
-    const runCmd = input
-      ? `timeout 5s ${runCmdBase} < ${inputFile}`
-      : `timeout 5s ${runCmdBase}`;
-    const programOutput = await executeCommand(container, ["sh", "-c", runCmd]);
+    // Step 3: Execute code
+    logger.info({
+      log: "Executing code...",
+    });
+    const runCommand = config.run(sourceFile, programFile);
+    const fullCommand = input
+      ? `timeout 1s ${runCommand} < ${inputFile}`
+      : `timeout 1s ${runCommand}`;
 
-    if (programOutput.exitCode === 124) {
-      // timeout exit code
-      return {
-        success: false,
-        error: "Execution timed out after 5 seconds",
-      };
-    }
+    const execResult = await executeCommand(container, [
+      "sh",
+      "-c",
+      fullCommand,
+    ]);
+    logger.info({
+      log: "Code execution completed:",
+      exitCode: execResult.exitCode,
+      stdout: execResult.stdout,
+      stderr: execResult.stderr,
+    });
 
-    // Return execution result
-    return {
-      success: programOutput.exitCode === 0,
-      output: programOutput.stdout,
-      error: programOutput.stderr,
-    };
-  } catch (error) {
+    // Step 4: Return output immediately
+    return getOutput(execResult);
+  } catch (err) {
+    logger.error({
+      log: "Unhandled error during code execution:",
+      error: err,
+    });
     return {
       success: false,
-      error: error.message,
+      error: `Unhandled error: ${err.message || err}`,
     };
   } finally {
-    // Stop and remove container in the background
+    // Stop container asynchronously — don't wait
     if (container) {
+      logger.info({
+        log: "Stopping container...",
+      });
       container.stop().catch((err) => {
-        console.error("Error stopping container:", err);
+        logger.warn({
+          log: "Non-critical: Error stopping container",
+          error: err.message,
+        });
       });
     }
   }
-}
-
-/**
- * Executes a command inside a Docker container and captures output.
- * @param {Docker.Container} container - The Docker container instance
- * @param {string[]} cmd - Command array to execute
- * @returns {Promise<{ stdout: string, stderr: string, exitCode: number }>} Command output and exit code
- */
-async function executeCommand(container, cmd) {
-  const exec = await container.exec({
-    Cmd: cmd,
-    AttachStdout: true,
-    AttachStderr: true,
-  });
-
-  const stream = await exec.start({ hijack: true, stdin: false });
-  const stdout = new PassThrough();
-  const stderr = new PassThrough();
-
-  container.modem.demuxStream(stream, stdout, stderr);
-
-  let stdoutData = "";
-  let stderrData = "";
-
-  stdout.on("data", (chunk) => (stdoutData += chunk.toString()));
-  stderr.on("data", (chunk) => (stderrData += chunk.toString()));
-
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      stream.destroy();
-      reject(new Error("Command execution timed out"));
-    }, 10000); // 10 second timeout
-
-    stream.on("end", async () => {
-      clearTimeout(timeout);
-      try {
-        const { ExitCode } = await exec.inspect();
-        resolve({
-          stdout: stdoutData,
-          stderr: stderrData,
-          exitCode: ExitCode,
-        });
-      } catch (error) {
-        reject(error);
-      }
-    });
-
-    stream.on("error", (error) => {
-      clearTimeout(timeout);
-      reject(error);
-    });
-  });
 }
