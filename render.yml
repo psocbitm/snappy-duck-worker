@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: snappy-duck-worker
+    env: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: 3000
+    ports:
+      - port: 3000
+        protocol: tcp
+    disk:
+      name: docker-socket
+      mountPath: /var/run/docker.sock
+      sizeGB: 1
