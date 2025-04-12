@@ -8,9 +8,6 @@ services:
     envVars:
       - key: PORT
         value: 3000
-    ports:
-      - port: 3000
-        protocol: tcp
     disk:
       name: docker-socket
       mountPath: /var/run/docker.sock
